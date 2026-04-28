@@ -1,0 +1,447 @@
+"""
+procesar_animales_v2.py
+=======================
+Script para procesar el archivo Excel de perfiles de animales de compañía
+y generar un CSV final con transformaciones y enriquecimiento de datos.
+
+CAMBIOS RESPECTO A v1:
+  - FIX #1: NUM_EDAD_ANIO ahora se calcula hasta Fec_efecto_spto (no hasta hoy)
+  - FIX #2: D_s_a_Asis_Vet_Premium solo se rellena para Modalidad==200133,
+            y en ese caso D_s_a_Asis_Vet se pone a 0 (igual que el VBA)
+  - FMT:    Separador de salida cambiado a "," (en lugar de ";")
+
+Uso:
+    python procesar_animales_v2.py
+
+Dependencias:
+    pip install pandas openpyxl
+"""
+
+import sys
+import tkinter as tk
+from tkinter import filedialog
+from datetime import date
+import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# CONFIGURACIÓN
+# ---------------------------------------------------------------------------
+
+CSV_SEPARATOR = ","          # Separador del CSV de salida
+CSV_ENCODING  = "utf-8"      # Encoding de salida
+
+COL_FECHA_NAC    = "Fec_nacimiento"
+COL_FECHA_EFECTO = "Fec_efecto_spto"
+COL_RAZA1        = "Raza_1"
+COL_RAZA2        = "Raza_2"
+COL_ASIS_VET     = "D_s_a_Asis_Vet"
+COL_MODALIDAD    = "Modalidad"
+
+MODALIDAD_PREMIUM = "200133"   # Código de modalidad que activa el trasvase Vet→Premium
+
+
+# ---------------------------------------------------------------------------
+# SELECCIÓN DE ARCHIVOS (tkinter)
+# ---------------------------------------------------------------------------
+
+def _make_root():
+    root = tk.Tk()
+    root.withdraw()
+    return root
+
+
+def seleccionar_archivo_entrada() -> str:
+    root = _make_root()
+    ruta = filedialog.askopenfilename(
+        title="Selecciona el archivo Excel de entrada",
+        filetypes=[("Archivos Excel", "*.xlsx *.xls"), ("Todos", "*.*")],
+    )
+    root.destroy()
+    if not ruta:
+        print("❌ No se seleccionó ningún archivo de entrada. Saliendo.")
+        sys.exit(0)
+    return ruta
+
+
+def seleccionar_archivo_razas() -> str:
+    root = _make_root()
+    ruta = filedialog.askopenfilename(
+        title="Selecciona el archivo de correspondencias de razas (RazaCod)",
+        filetypes=[("Archivos Excel", "*.xlsx *.xls"), ("Todos", "*.*")],
+    )
+    root.destroy()
+    if not ruta:
+        print("❌ No se seleccionó el archivo de razas. Saliendo.")
+        sys.exit(0)
+    return ruta
+
+
+def seleccionar_archivo_salida() -> str:
+    root = _make_root()
+    ruta = filedialog.asksaveasfilename(
+        title="Guarda el CSV de salida",
+        defaultextension=".csv",
+        filetypes=[("CSV", "*.csv"), ("Todos", "*.*")],
+    )
+    root.destroy()
+    if not ruta:
+        print("❌ No se seleccionó destino de salida. Saliendo.")
+        sys.exit(0)
+    return ruta
+
+
+# ---------------------------------------------------------------------------
+# LECTURA DE DATOS
+# ---------------------------------------------------------------------------
+
+def leer_excel_entrada(ruta: str) -> pd.DataFrame:
+    try:
+        df = pd.read_excel(ruta)
+        print(f"✅ Archivo de entrada cargado: {df.shape[0]} filas × {df.shape[1]} columnas")
+        return df
+    except FileNotFoundError:
+        print(f"❌ Archivo no encontrado: {ruta}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Error al leer el archivo de entrada: {e}")
+        sys.exit(1)
+
+
+def leer_excel_razas(ruta: str):
+    try:
+        df_razas = pd.read_excel(ruta)
+    except FileNotFoundError:
+        print(f"❌ Archivo de razas no encontrado: {ruta}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Error al leer el archivo de razas: {e}")
+        sys.exit(1)
+
+    # Mapa Raza 1: nombre → código
+    if "Raza_1" not in df_razas.columns or "Raza_1.1" not in df_razas.columns:
+        print("⚠️  Columnas de Raza_1 no encontradas en el archivo de razas.")
+        raza1_map = {}
+    else:
+        df_r1 = df_razas[["Raza_1", "Raza_1.1"]].dropna(subset=["Raza_1", "Raza_1.1"])
+        df_r1 = df_r1.drop_duplicates(subset=["Raza_1"])
+        raza1_map = dict(zip(df_r1["Raza_1"].astype(str).str.strip(),
+                             df_r1["Raza_1.1"].astype(int)))
+
+    # Mapa Raza 2: nombre → código  (columnas Raza_2.1 → Raza_2)
+    if "Raza_2" not in df_razas.columns or "Raza_2.1" not in df_razas.columns:
+        print("⚠️  Columnas de Raza_2 no encontradas en el archivo de razas.")
+        raza2_map = {}
+    else:
+        df_r2 = df_razas[["Raza_2.1", "Raza_2"]].dropna(subset=["Raza_2.1", "Raza_2"])
+        df_r2 = df_r2.drop_duplicates(subset=["Raza_2.1"])
+        raza2_map = dict(zip(df_r2["Raza_2.1"].astype(str).str.strip(),
+                             df_r2["Raza_2"].astype(int)))
+
+    print(f"✅ Mapa de razas cargado: {len(raza1_map)} entradas Raza1, {len(raza2_map)} entradas Raza2")
+    return raza1_map, raza2_map
+
+
+# ---------------------------------------------------------------------------
+# VALIDACIONES
+# ---------------------------------------------------------------------------
+
+def validar_columnas(df: pd.DataFrame, columnas_requeridas: list) -> None:
+    faltantes = [c for c in columnas_requeridas if c not in df.columns]
+    if faltantes:
+        print(f"❌ Columnas requeridas no encontradas en el archivo: {faltantes}")
+        sys.exit(1)
+    print("✅ Todas las columnas requeridas están presentes.")
+
+
+# ---------------------------------------------------------------------------
+# TRANSFORMACIONES
+# ---------------------------------------------------------------------------
+
+def calcular_edad_anios(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    FIX #1 — Edad en años completos desde Fec_nacimiento hasta Fec_efecto_spto.
+    (El script anterior usaba date.today(), lo que daba ~1 año de más.)
+    """
+    def edad_exacta(row):
+        fec_nac = row[COL_FECHA_NAC]
+        fec_ef  = row[COL_FECHA_EFECTO]
+        if pd.isna(fec_nac) or pd.isna(fec_ef):
+            return None
+        try:
+            nac = fec_nac.date() if hasattr(fec_nac, "date") else pd.Timestamp(fec_nac).date()
+            ref = fec_ef.date()  if hasattr(fec_ef,  "date") else pd.Timestamp(fec_ef).date()
+            anios = ref.year - nac.year
+            # Restar 1 si el cumpleaños aún no ha llegado en la fecha de efecto
+            if (ref.month, ref.day) < (nac.month, nac.day):
+                anios -= 1
+            return anios
+        except Exception:
+            return None
+
+    df["NUM_EDAD_ANIO"] = df.apply(edad_exacta, axis=1)
+    return df
+
+
+def calcular_asis_vet_premium(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    FIX #2 — Replicar lógica VBA exactamente:
+      - Solo si Modalidad == 200133 (ya normalizada):
+          D_s_a_Asis_Vet_Premium  = valor de D_s_a_Asis_Vet
+          D_s_a_Asis_Vet          = 0
+      - En el resto de filas ambas columnas quedan a 0.
+    """
+    # Asegurarse de que la columna existe con valor por defecto 0
+    df["D_s_a_Asis_Vet_Premium"] = 0
+
+    if COL_ASIS_VET not in df.columns or COL_MODALIDAD not in df.columns:
+        print(f"⚠️  Columnas '{COL_ASIS_VET}' o '{COL_MODALIDAD}' no encontradas; "
+              "D_s_a_Asis_Vet_Premium queda a 0.")
+        return df
+
+    mascara_premium = df[COL_MODALIDAD].astype(str).str.strip() == MODALIDAD_PREMIUM
+
+    # Filas Premium: mover Vet → VetPremium y poner Vet a 0
+    df.loc[mascara_premium, "D_s_a_Asis_Vet_Premium"] = df.loc[mascara_premium, COL_ASIS_VET]
+    df.loc[mascara_premium, COL_ASIS_VET] = 0
+
+    n = mascara_premium.sum()
+    print(f"   · D_s_a_Asis_Vet_Premium: {n} filas de modalidad {MODALIDAD_PREMIUM} trasvasadas.")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# LIMPIEZA DE COLUMNAS EXISTENTES (sin cambios respecto a v1)
+# ---------------------------------------------------------------------------
+
+def limpiar_regimen(df: pd.DataFrame) -> pd.DataFrame:
+    if "Regimen" not in df.columns:
+        return df
+    df["Regimen"] = (
+        df["Regimen"].astype(str).str.strip()
+        .str.extract(r"^([JF])", expand=False).fillna("0")
+    )
+    return df
+
+
+def limpiar_modalidad(df: pd.DataFrame) -> pd.DataFrame:
+    if "Modalidad" not in df.columns:
+        return df
+    df["Modalidad"] = (
+        df["Modalidad"].astype(str).str.strip()
+        .str.extract(r"^(\d+)", expand=False).fillna("0")
+    )
+    return df
+
+
+def limpiar_forma_pago(df: pd.DataFrame) -> pd.DataFrame:
+    if "Forma_Pago" not in df.columns:
+        return df
+    df["Forma_Pago"] = (
+        df["Forma_Pago"].astype(str).str.strip()
+        .str.extract(r"^([123])", expand=False).fillna("0")
+    )
+    return df
+
+
+def limpiar_especie_y_cod_clase(df: pd.DataFrame) -> pd.DataFrame:
+    if "Especie" not in df.columns:
+        df["COD_CLASE_OTROS"] = "0"
+        return df
+    raw    = df["Especie"].astype(str).str.strip()
+    codigo = raw.str.extract(r"^(\d+)", expand=False).fillna("")
+    df["Especie"]        = codigo.str[:1].replace("", "0")
+    df["COD_CLASE_OTROS"] = codigo.str[1:2].replace("", "0").fillna("0")
+    df["COD_CLASE_OTROS"] = df["COD_CLASE_OTROS"].where(df["COD_CLASE_OTROS"] != "", "0")
+    return df
+
+
+def limpiar_provincia(df: pd.DataFrame) -> pd.DataFrame:
+    if "Provincia" not in df.columns:
+        return df
+    df["Provincia"] = (
+        df["Provincia"].astype(str).str.strip()
+        .str.extract(r"^(\d+)", expand=False).fillna("0")
+    )
+    return df
+
+
+def limpiar_booleano_sn(df: pd.DataFrame, columna: str) -> pd.DataFrame:
+    if columna not in df.columns:
+        return df
+    df[columna] = (
+        df[columna].astype(str).str.strip()
+        .str.extract(r"^([SN])", expand=False).fillna("0")
+    )
+    return df
+
+
+def limpiar_sexo(df: pd.DataFrame) -> pd.DataFrame:
+    if "Sexo" not in df.columns:
+        return df
+    df["Sexo"] = (
+        df["Sexo"].astype(str).str.strip()
+        .str.extract(r"^([MH])", expand=False).fillna("0")
+    )
+    return df
+
+
+def limpiar_uso_animal(df: pd.DataFrame) -> pd.DataFrame:
+    if "Uso_animal" not in df.columns:
+        return df
+    df["Uso_animal"] = (
+        df["Uso_animal"].astype(str).str.strip()
+        .str.extract(r"^([FA])", expand=False).fillna("0")
+    )
+    return df
+
+
+def limpiar_clase(df: pd.DataFrame) -> pd.DataFrame:
+    if "Clase" not in df.columns:
+        return df
+    df["Clase"] = (
+        df["Clase"].astype(str).str.strip()
+        .str.extract(r"^([12])", expand=False).fillna("0")
+    )
+    return df
+
+
+def formatear_fecha_efecto(df: pd.DataFrame) -> pd.DataFrame:
+    df["FEC_EFECTO_SPTO_FORMATEADA"] = pd.to_datetime(
+        df[COL_FECHA_EFECTO], errors="coerce"
+    ).dt.strftime("%Y-%m-%dT00:00:00.000+0100")
+    return df
+
+
+def mapear_razas(df: pd.DataFrame, raza1_map: dict, raza2_map: dict) -> pd.DataFrame:
+    if COL_RAZA1 in df.columns:
+        df["RazaCod1"] = df[COL_RAZA1].astype(str).str.strip().map(raza1_map)
+    else:
+        df["RazaCod1"] = None
+        print(f"⚠️  Columna '{COL_RAZA1}' no encontrada; RazaCod1 queda vacía.")
+
+    if COL_RAZA2 in df.columns:
+        df["RazaCod2"] = df[COL_RAZA2].astype(str).str.strip().map(raza2_map)
+    else:
+        df["RazaCod2"] = None
+        print(f"⚠️  Columna '{COL_RAZA2}' no encontrada; RazaCod2 queda vacía.")
+
+    return df
+
+
+def normalizar_decimales(df: pd.DataFrame) -> pd.DataFrame:
+    for col in df.columns:
+        if df[col].dtype == object:
+            muestra = df[col].dropna().astype(str).head(20)
+            if muestra.str.match(r"^-?\d+,\d+$").any():
+                df[col] = (
+                    df[col].astype(str)
+                    .str.replace(",", ".", regex=False)
+                    .pipe(pd.to_numeric, errors="coerce")
+                )
+    return df
+
+
+# ---------------------------------------------------------------------------
+# EXPORTACIÓN
+# ---------------------------------------------------------------------------
+
+def exportar_csv(df: pd.DataFrame, ruta_salida: str) -> None:
+    try:
+        df.to_csv(ruta_salida, sep=CSV_SEPARATOR, encoding=CSV_ENCODING, index=False)
+        print(f"✅ CSV generado correctamente en: {ruta_salida}")
+    except Exception as e:
+        print(f"❌ Error al guardar el CSV: {e}")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# RESUMEN
+# ---------------------------------------------------------------------------
+
+def mostrar_resumen(df: pd.DataFrame, columnas_nuevas: list) -> None:
+    print("\n" + "=" * 55)
+    print("  RESUMEN DEL PROCESAMIENTO")
+    print("=" * 55)
+    print(f"  Filas procesadas   : {df.shape[0]:,}")
+    print(f"  Columnas totales   : {df.shape[1]}")
+    print(f"  Columnas añadidas  : {len(columnas_nuevas)}")
+    for col in columnas_nuevas:
+        no_nulos = df[col].notna().sum()
+        print(f"    · {col:<35} {no_nulos:>6} valores no nulos")
+    print("=" * 55 + "\n")
+
+
+# ---------------------------------------------------------------------------
+# FLUJO PRINCIPAL
+# ---------------------------------------------------------------------------
+
+def main():
+    print("\n🐾 Procesador de perfiles — Animales de Compañía  [v2]\n")
+
+    # 1. Selección de archivos
+    print("→ Selecciona el archivo Excel de ENTRADA...")
+    ruta_entrada = seleccionar_archivo_entrada()
+
+    print("→ Selecciona el archivo de correspondencias de RAZAS...")
+    ruta_razas = seleccionar_archivo_razas()
+
+    print("→ Selecciona la ubicación y nombre del CSV de SALIDA...")
+    ruta_salida = seleccionar_archivo_salida()
+
+    # 2. Lectura
+    df = leer_excel_entrada(ruta_entrada)
+    raza1_map, raza2_map = leer_excel_razas(ruta_razas)
+
+    # 3. Validación mínima
+    validar_columnas(df, [COL_FECHA_NAC, COL_FECHA_EFECTO])
+
+    # 4. Transformaciones
+    columnas_nuevas = [
+        "NUM_EDAD_ANIO",
+        "D_s_a_Asis_Vet_Premium",
+        "COD_CLASE_OTROS",
+        "FEC_EFECTO_SPTO_FORMATEADA",
+        "RazaCod1",
+        "RazaCod2",
+    ]
+
+    print("\n→ Aplicando transformaciones...")
+
+    # Limpieza de columnas existentes
+    # IMPORTANTE: limpiar_modalidad ANTES de calcular_asis_vet_premium
+    # para que la comparación con "200133" funcione correctamente
+    df = limpiar_regimen(df)
+    df = limpiar_modalidad(df)          # ← debe ir antes de asis_vet_premium
+    df = limpiar_forma_pago(df)
+    df = limpiar_especie_y_cod_clase(df)
+    df = limpiar_provincia(df)
+    df = limpiar_booleano_sn(df, "Perro_Peligroso")
+    df = limpiar_booleano_sn(df, "Dec_Salud")
+    df = limpiar_sexo(df)
+    df = limpiar_uso_animal(df)
+    df = limpiar_clase(df)
+
+    # Nuevas columnas calculadas
+    df = calcular_edad_anios(df)        # FIX #1: usa Fec_efecto_spto, no today()
+    df = calcular_asis_vet_premium(df)  # FIX #2: trasvase solo para modalidad 200133
+    df = formatear_fecha_efecto(df)
+    df = mapear_razas(df, raza1_map, raza2_map)
+    df = normalizar_decimales(df)
+
+    # Rellenar vacíos con 0
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = df[col].fillna("0")
+        else:
+            df[col] = df[col].fillna(0)
+
+    # 5. Exportación
+    exportar_csv(df, ruta_salida)
+
+    # 6. Resumen
+    mostrar_resumen(df, columnas_nuevas)
+
+
+if __name__ == "__main__":
+    main()
